@@ -5,9 +5,7 @@
 
 import os
 
-# Use PyTorch for Sentence Transformers
-os.environ["USE_TF"] = "0"
-os.environ["USE_FLAX"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 # ==========================================
@@ -18,7 +16,6 @@ import faiss
 import numpy as np
 
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer
 
 from backend.config import (
     OPENROUTER_API_KEY,
@@ -32,18 +29,10 @@ from backend.config import (
 
 
 # ==========================================
-# 3. INITIALIZE MODELS AND VARIABLES
+# 3. INITIALIZE OPENROUTER CLIENT
 # ==========================================
 
-print("Loading embedding model...")
-
-embedding_model = SentenceTransformer(
-    EMBEDDING_MODEL,
-    device="cpu"
-)
-
-print("Embedding model loaded successfully!")
-
+print("Initializing OpenRouter client...")
 
 if OPENROUTER_API_KEY:
 
@@ -52,19 +41,28 @@ if OPENROUTER_API_KEY:
         base_url=OPENROUTER_BASE_URL
     )
 
+    print("OpenRouter client initialized successfully!")
+
 else:
+
     client = None
 
+    print("Warning: OpenRouter API key is missing.")
 
-# Active document data
+
+# ==========================================
+# 4. ACTIVE DOCUMENT VARIABLES
+# ==========================================
 
 vector_index = None
+
 document_chunks = []
+
 document_pages = []
 
 
 # ==========================================
-# 4. TEXT CHUNKING
+# 5. TEXT CHUNKING
 # ==========================================
 
 def create_chunks(pages):
@@ -117,14 +115,21 @@ def create_chunks(pages):
 
 
 # ==========================================
-# 5. GENERATE EMBEDDINGS
+# 6. GENERATE EMBEDDINGS USING OPENROUTER
 # ==========================================
 
 def generate_embeddings(chunks):
     """
-    Convert text chunks into numerical vectors
-    using Sentence Transformers.
+    Generate numerical embeddings through OpenRouter.
+
+    Processes text in small batches to control
+    memory consumption.
     """
+
+    if client is None:
+        raise ValueError(
+            "OpenRouter API key is missing."
+        )
 
     if not chunks:
         raise ValueError(
@@ -135,28 +140,141 @@ def generate_embeddings(chunks):
         chunk["text"] for chunk in chunks
     ]
 
-    embeddings = embedding_model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False
+    all_embeddings = []
+
+    BATCH_SIZE = 32
+
+    print(
+        f"Generating embeddings for {len(texts)} chunks..."
     )
 
+    for start in range(0, len(texts), BATCH_SIZE):
+
+        batch = texts[start:start + BATCH_SIZE]
+
+        try:
+
+            response = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=batch
+            )
+
+            # Preserve the original input order.
+            batch_data = sorted(
+                response.data,
+                key=lambda item: item.index
+            )
+
+            if len(batch_data) != len(batch):
+
+                raise ValueError(
+                    "Embedding response count does not "
+                    "match input batch size."
+                )
+
+            for item in batch_data:
+
+                all_embeddings.append(item.embedding)
+
+            print(
+                f"Embedding batch "
+                f"{start // BATCH_SIZE + 1} completed."
+            )
+
+        except Exception as e:
+
+            raise RuntimeError(
+                f"Embedding generation failed: {str(e)}"
+            ) from e
+
     embeddings = np.asarray(
-        embeddings,
+        all_embeddings,
         dtype="float32"
     )
 
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(texts):
+
+        raise ValueError(
+            "Invalid embedding dimensions returned by API."
+        )
+
+    if embeddings.shape[1] == 0:
+
+        raise ValueError(
+            "Embedding dimension cannot be zero."
+        )
+
     if not np.isfinite(embeddings).all():
+
         raise ValueError(
             "Invalid values found in generated embeddings."
         )
+
+    # Normalize vectors for cosine similarity.
+    faiss.normalize_L2(embeddings)
 
     return embeddings
 
 
 # ==========================================
-# 6. BUILD FAISS VECTOR DATABASE
+# 7. GENERATE QUESTION EMBEDDING
+# ==========================================
+
+def generate_query_embedding(question):
+    """
+    Generate embedding for a user question.
+    Uses the same model as document embeddings.
+    """
+
+    if client is None:
+
+        raise ValueError(
+            "OpenRouter API key is missing."
+        )
+
+    if not question or not question.strip():
+
+        raise ValueError(
+            "Question cannot be empty."
+        )
+
+    try:
+
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=[question.strip()]
+        )
+
+        if not response.data:
+
+            raise ValueError(
+                "No query embedding returned by OpenRouter."
+            )
+
+        embedding = np.asarray(
+            response.data[0].embedding,
+            dtype="float32"
+        ).reshape(1, -1)
+
+        if not np.isfinite(embedding).all():
+
+            raise ValueError(
+                "Invalid query embedding values."
+            )
+
+        faiss.normalize_L2(embedding)
+
+        return embedding
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Query embedding generation failed: {str(e)}"
+        ) from e
+
+
+# ==========================================
+# 8. BUILD FAISS VECTOR DATABASE
 # ==========================================
 
 def build_vector_store(pages):
@@ -170,41 +288,47 @@ def build_vector_store(pages):
     global document_pages
 
     if not pages:
+
         raise ValueError(
             "No readable text found in PDF."
         )
 
-    # Step 1: Create chunks
+    # Step 1: Create chunks.
     new_chunks = create_chunks(pages)
 
     if not new_chunks:
+
         raise ValueError(
             "Could not create text chunks. "
             "Check whether your PDF contains selectable text."
         )
 
-    # Step 2: Generate embeddings
+    # Step 2: Generate embeddings through OpenRouter.
     embeddings = generate_embeddings(new_chunks)
 
-    # Step 3: Create FAISS index
+    # Step 3: Create FAISS index.
     dimension = embeddings.shape[1]
 
     new_index = faiss.IndexFlatIP(dimension)
 
     new_index.add(embeddings)
 
-    # Step 4: Save FAISS index
+    # Step 4: Save FAISS index.
     index_directory = os.path.dirname(VECTOR_DB_PATH)
 
     if index_directory:
-        os.makedirs(index_directory, exist_ok=True)
+
+        os.makedirs(
+            index_directory,
+            exist_ok=True
+        )
 
     faiss.write_index(
         new_index,
         VECTOR_DB_PATH
     )
 
-    # Step 5: Update active document
+    # Step 5: Update active document.
     vector_index = new_index
 
     document_chunks = new_chunks
@@ -227,7 +351,7 @@ def build_vector_store(pages):
 
 
 # ==========================================
-# 7. RETRIEVE RELEVANT CHUNKS
+# 9. RETRIEVE RELEVANT CHUNKS
 # ==========================================
 
 def retrieve_context(question, top_k=4):
@@ -254,19 +378,12 @@ def retrieve_context(question, top_k=4):
             "top_k must be greater than zero."
         )
 
-    # Generate question embedding
-    question_embedding = embedding_model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True
+    # Generate question embedding.
+    question_embedding = generate_query_embedding(
+        question
     )
 
-    question_embedding = np.asarray(
-        question_embedding,
-        dtype="float32"
-    )
-
-    # Search FAISS
+    # Search FAISS.
     number_of_results = min(
         top_k,
         len(document_chunks)
@@ -296,7 +413,7 @@ def retrieve_context(question, top_k=4):
 
 
 # ==========================================
-# 8. GENERATE ANSWER USING OPENROUTER
+# 10. GENERATE ANSWER USING OPENROUTER
 # ==========================================
 
 def generate_answer(question, chat_history=None):
@@ -311,7 +428,7 @@ def generate_answer(question, chat_history=None):
 
         raise ValueError(
             "OpenRouter API key is missing. "
-            "Check your .env file."
+            "Check your environment variables."
         )
 
     if not question or not question.strip():
@@ -350,12 +467,6 @@ def generate_answer(question, chat_history=None):
     # ======================================
     # STEP 2: BUILD RETRIEVAL QUERY
     # ======================================
-
-    # Recent user questions help FAISS understand
-    # follow-up questions such as:
-    # "Explain it again"
-    # "Give me an example"
-    # "What are its advantages?"
 
     previous_user_questions = [
         message["content"]
@@ -455,10 +566,8 @@ LATEST USER QUESTION:
 
     ]
 
-    # Add previous conversation
     messages.extend(valid_history)
 
-    # Add latest question with retrieved PDF context
     messages.append({
         "role": "user",
         "content": prompt
@@ -511,7 +620,7 @@ LATEST USER QUESTION:
 
 
 # ==========================================
-# 9. PDF SUMMARIZATION
+# 11. PDF SUMMARIZATION
 # ==========================================
 
 def summarize_document(summary_type="short"):
@@ -527,8 +636,7 @@ def summarize_document(summary_type="short"):
     if client is None:
 
         raise ValueError(
-            "OpenRouter API key is missing. "
-            "Check your .env file."
+            "OpenRouter API key is missing."
         )
 
     if not document_pages:
@@ -836,7 +944,7 @@ PARTIAL SUMMARIES:
 
 
 # ==========================================
-# 10. RESET VECTOR DATABASE
+# 12. RESET VECTOR DATABASE
 # ==========================================
 
 def reset_vector_store():

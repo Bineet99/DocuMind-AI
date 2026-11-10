@@ -6,4 +6,5 @@ openai
 numpy
 faiss-cpu
 pypdf
+PyMuPDF
 python-dotenv

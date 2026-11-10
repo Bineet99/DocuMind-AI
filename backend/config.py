@@ -14,7 +14,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "openrouter/free"
 
 # Embedding Model
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
 
 # FAISS Configuration
 VECTOR_DB_PATH = "data/faiss_index"
